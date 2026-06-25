@@ -21,7 +21,7 @@ pub struct SendRequest {
 }
 
 /// 跳转链中的一跳。
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Hop {
     pub url: String,
     pub status_code: u16,
@@ -30,7 +30,7 @@ pub struct Hop {
 }
 
 /// sender → jump_svc 的回传体。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendResponse {
     pub hops: Vec<Hop>,
     pub error: String,
