@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
-FROM rust:1.82-bookworm AS build
+FROM rust:1.89-bookworm AS build
 WORKDIR /workspace
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
