@@ -8,7 +8,7 @@ use tiny_http::{Header, Method, Response, Server};
 use rust_click::contract::SendRequest;
 use rust_click::handler::{error_json, handle_send_json};
 
-use crate::fetcher::ReqwestFetcher;
+use crate::fetcher::ReqwestFetcherPool;
 
 fn main() {
     let port = std::env::var("PORT").unwrap_or_else(|_| "18001".to_string());
@@ -20,6 +20,7 @@ fn main() {
     let addr = format!("0.0.0.0:{}", port);
 
     let server = Arc::new(Server::http(&addr).expect("bind server"));
+    let fetcher_pool = Arc::new(ReqwestFetcherPool::pool_from_env());
     println!(
         "rust_click sender listening on {} ({} workers)",
         addr, workers
@@ -28,9 +29,10 @@ fn main() {
     let mut guards = Vec::with_capacity(workers);
     for _ in 0..workers {
         let server = server.clone();
+        let fetcher_pool = fetcher_pool.clone();
         guards.push(thread::spawn(move || {
             for req in server.incoming_requests() {
-                handle(req);
+                handle(req, &fetcher_pool);
             }
         }));
     }
@@ -39,7 +41,7 @@ fn main() {
     }
 }
 
-fn handle(mut req: tiny_http::Request) {
+fn handle(mut req: tiny_http::Request, fetcher_pool: &ReqwestFetcherPool) {
     if req.method() != &Method::Post || req.url() != "/send" {
         let _ = req.respond(Response::empty(404));
         return;
@@ -56,10 +58,14 @@ fn handle(mut req: tiny_http::Request) {
         .map(|r| r.proxy)
         .unwrap_or_default();
 
-    let fetcher = match ReqwestFetcher::new(&proxy) {
+    let fetcher = match fetcher_pool.fetcher(&proxy) {
         Ok(f) => f,
         Err(e) => {
-            let _ = respond_json(req, &error_json(&format!("build client failed: {}", e)), 500);
+            let _ = respond_json(
+                req,
+                &error_json(&format!("build client failed: {}", e)),
+                500,
+            );
             return;
         }
     };
@@ -69,8 +75,8 @@ fn handle(mut req: tiny_http::Request) {
 }
 
 fn respond_json(req: tiny_http::Request, body: &str, status: u16) -> std::io::Result<()> {
-    let header = Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
-        .expect("valid header");
+    let header =
+        Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).expect("valid header");
     let resp = Response::from_string(body)
         .with_status_code(status)
         .with_header(header);
