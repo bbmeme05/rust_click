@@ -2,8 +2,14 @@
 
 FROM rust:1.89-bookworm AS build
 WORKDIR /workspace
+# BoringSSL (pulled in by wreq) is built from source and needs cmake plus a
+# libclang for bindgen.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake clang libclang-dev perl \
+    && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY data ./data
 RUN cargo build --release --bin rust_click
 
 FROM debian:bookworm-slim

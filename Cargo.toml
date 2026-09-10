@@ -7,8 +7,13 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 tiny_http = "0.12"
+# BoringSSL based impersonation client (rquest/wreq family): custom ciphers,
+# curves, sigalgs, extension permutation, GREASE and HTTP/2 fingerprint.
+wreq = "=0.15.3"
+# Community emulation profiles (Chrome/Safari/Firefox/OkHttp) used as fallback.
+wreq-util = "=0.1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
 
 [[bin]]
 name = "rust_click"

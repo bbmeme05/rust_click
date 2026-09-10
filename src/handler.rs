@@ -9,7 +9,12 @@ pub fn handle_send_json<F: HopFetcher>(body: &[u8], fetcher: &F) -> String {
         Err(e) => return error_json(&format!("invalid request: {}", e)),
     };
 
-    let resp = follow_redirects(fetcher, &req);
+    handle_send_parsed(&req, fetcher)
+}
+
+/// 与 `handle_send_json` 相同，但复用调用方已解析的请求（main 已解析一次用于选指纹）。
+pub fn handle_send_parsed<F: HopFetcher>(req: &SendRequest, fetcher: &F) -> String {
+    let resp = follow_redirects(fetcher, req);
     serde_json::to_string(&resp).unwrap_or_else(|e| error_json(&e.to_string()))
 }
 

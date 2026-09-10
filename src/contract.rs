@@ -18,6 +18,10 @@ pub struct SendRequest {
     pub max_redirects: u32,
     #[serde(default)]
     pub proxy: String,
+    /// 可选：强制使用某个采集指纹 profile（`data/collected_profiles.json` 的 `id`）。
+    /// 空表示按 `ua` 自动选择；jump_svc 当前不发送该字段，属于向前兼容的扩展。
+    #[serde(default)]
+    pub fingerprint: String,
 }
 
 /// 跳转链中的一跳。

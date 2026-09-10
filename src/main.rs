@@ -1,16 +1,60 @@
-mod fetcher;
-
 use std::sync::Arc;
 use std::thread;
 
 use tiny_http::{Header, Method, Response, Server};
 
 use rust_click::contract::SendRequest;
-use rust_click::handler::{error_json, handle_send_json};
-
-use crate::fetcher::ReqwestFetcherPool;
+use rust_click::fetcher::WreqFetcherPool;
+use rust_click::fingerprint::Registry;
+use rust_click::handler::{error_json, handle_send_parsed};
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.iter().any(|a| a == "--list") {
+        list_profiles();
+        return;
+    }
+
+    if let Some(index) = args.iter().position(|a| a == "--verify") {
+        let url = args.get(index + 1).map(String::as_str);
+        let only = args.get(index + 2).map(String::as_str);
+        if let Err(err) = rust_click::verify::run(url, only) {
+            eprintln!("verify failed: {err}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    run_server();
+}
+
+fn list_profiles() {
+    let registry = Registry::from_embedded();
+    println!("{} collected fingerprint profile(s)", registry.len());
+    println!(
+        "{:<6} {:>6}  {:<46} {:<20} {}",
+        "id", "count", "ja4", "curves", "chrome"
+    );
+    for profile in registry.profiles() {
+        println!(
+            "{:<6} {:>6}  {:<46} {:<20} {}",
+            profile.id,
+            profile.count,
+            profile.ja4,
+            profile
+                .tls
+                .curves
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join("-"),
+            profile.chrome
+        );
+    }
+}
+
+fn run_server() {
     let port = std::env::var("PORT").unwrap_or_else(|_| "18001".to_string());
     let workers: usize = std::env::var("WORKERS")
         .ok()
@@ -20,28 +64,32 @@ fn main() {
     let addr = format!("0.0.0.0:{}", port);
 
     let server = Arc::new(Server::http(&addr).expect("bind server"));
-    let fetcher_pool = Arc::new(ReqwestFetcherPool::pool_from_env());
+    let fetcher_pool = Arc::new(WreqFetcherPool::pool_from_env());
+    let registry = Arc::new(Registry::from_embedded());
     println!(
-        "rust_click sender listening on {} ({} workers)",
-        addr, workers
+        "rust_click sender listening on {} ({} workers, {} fingerprint profiles)",
+        addr,
+        workers,
+        registry.len()
     );
 
     let mut guards = Vec::with_capacity(workers);
     for _ in 0..workers {
         let server = server.clone();
         let fetcher_pool = fetcher_pool.clone();
+        let registry = registry.clone();
         guards.push(thread::spawn(move || {
             for req in server.incoming_requests() {
-                handle(req, &fetcher_pool);
+                handle(req, &fetcher_pool, &registry);
             }
         }));
     }
-    for g in guards {
-        let _ = g.join();
+    for guard in guards {
+        let _ = guard.join();
     }
 }
 
-fn handle(mut req: tiny_http::Request, fetcher_pool: &ReqwestFetcherPool) {
+fn handle(mut req: tiny_http::Request, fetcher_pool: &WreqFetcherPool, registry: &Registry) {
     if req.method() != &Method::Post || req.url() != "/send" {
         let _ = req.respond(Response::empty(404));
         return;
@@ -53,24 +101,40 @@ fn handle(mut req: tiny_http::Request, fetcher_pool: &ReqwestFetcherPool) {
         return;
     }
 
-    // 先解析一次拿 proxy 以构建 client；解析失败时 handle_send_json 会再次解析并回传 error。
-    let proxy = serde_json::from_slice::<SendRequest>(&body)
-        .map(|r| r.proxy)
-        .unwrap_or_default();
+    let parsed: SendRequest = match serde_json::from_slice(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            let _ = respond_json(req, &error_json(&format!("invalid request: {}", err)), 200);
+            return;
+        }
+    };
 
-    let fetcher = match fetcher_pool.fetcher(&proxy) {
-        Ok(f) => f,
-        Err(e) => {
+    // Pick the TLS identity once and keep it for the whole redirect chain.
+    let selected = if parsed.fingerprint.is_empty() {
+        registry.select(&parsed.ua)
+    } else {
+        registry
+            .select_by_id(&parsed.fingerprint)
+            .unwrap_or_else(|| registry.select(&parsed.ua))
+    };
+
+    let fetcher = match fetcher_pool.fetcher(&parsed.proxy, &selected) {
+        Ok(fetcher) => fetcher,
+        Err(err) => {
             let _ = respond_json(
                 req,
-                &error_json(&format!("build client failed: {}", e)),
+                &error_json(&format!("build client failed: {}", err)),
                 500,
             );
             return;
         }
     };
 
-    let out = handle_send_json(&body, &fetcher);
+    if std::env::var("RUST_FINGERPRINT_LOG").is_ok() {
+        println!("fingerprint={} ua={}", selected.describe(), parsed.ua);
+    }
+
+    let out = handle_send_parsed(&parsed, &fetcher);
     let _ = respond_json(req, &out, 200);
 }
 

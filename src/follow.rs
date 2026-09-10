@@ -143,6 +143,7 @@ mod tests {
             timeout_ms: 5000,
             max_redirects,
             proxy: String::new(),
+            fingerprint: String::new(),
         }
     }
 
