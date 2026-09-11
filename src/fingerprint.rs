@@ -10,7 +10,7 @@
 //! to the community profiles shipped by `wreq-util` (Chrome/Safari/Firefox/OkHttp).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use wreq::header::{HeaderMap, HeaderName, HeaderValue};
@@ -669,7 +669,18 @@ fn community_chrome(major: Option<u32>) -> Emulation {
 
 /// Convenience: build a client for a selected fingerprint.
 pub fn build_client(selected: &Selected, proxy: &str) -> Result<wreq::Client, String> {
-    let mut builder = wreq::Client::builder().redirect(wreq::redirect::Policy::none());
+    // wreq defaults to `pool_max_idle_per_host = usize::MAX` with a 90s idle
+    // timeout, so a long-lived impersonating client keeps accumulating idle
+    // connections across every host a click chain touches. Combined with up to
+    // 1024 pooled clients that is what drove the sidecar into OOMKilled. Bound
+    // both the per-client pool and the idle lifetime.
+    let mut builder = wreq::Client::builder()
+        .redirect(wreq::redirect::Policy::none())
+        .pool_max_idle_per_host(env_usize_or("RUST_POOL_MAX_IDLE_PER_HOST", 2))
+        .pool_max_size(env_usize_or("RUST_POOL_MAX_SIZE", 16))
+        .pool_idle_timeout(Duration::from_secs(
+            env_usize_or("RUST_POOL_IDLE_TIMEOUT_SECONDS", 30) as u64,
+        ));
     if !proxy.is_empty() {
         let parsed = wreq::Proxy::all(proxy).map_err(|e| e.to_string())?;
         builder = builder.proxy(parsed);
@@ -679,6 +690,15 @@ pub fn build_client(selected: &Selected, proxy: &str) -> Result<wreq::Client, St
         Selected::Community(emulation) => builder.emulation(*emulation),
     };
     builder.build().map_err(|e| e.to_string())
+}
+
+/// Positive `usize` from the environment, falling back to `default`.
+fn env_usize_or(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
 }
 
 /// Small helper used by tests/CLI: describe the embedded registry.

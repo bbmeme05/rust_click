@@ -9,6 +9,8 @@ use rust_click::fingerprint::Registry;
 use rust_click::handler::{error_json, handle_send_parsed};
 
 fn main() {
+    install_panic_hook();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     if args.iter().any(|a| a == "--list") {
@@ -66,6 +68,7 @@ fn run_server() {
     let server = Arc::new(Server::http(&addr).expect("bind server"));
     let fetcher_pool = Arc::new(WreqFetcherPool::pool_from_env());
     let registry = Arc::new(Registry::from_embedded());
+    spawn_pool_stats_logger(fetcher_pool.clone());
     println!(
         "rust_click sender listening on {} ({} workers, {} fingerprint profiles)",
         addr,
@@ -80,7 +83,19 @@ fn run_server() {
         let registry = registry.clone();
         guards.push(thread::spawn(move || {
             for req in server.incoming_requests() {
-                handle(req, &fetcher_pool, &registry);
+                // A panic that unwinds into tiny_http poisons its internal
+                // task-pool mutex, after which every worker panics at
+                // task_pool.rs and the sidecar stops accepting connections.
+                // Contain it here so one bad request cannot kill the worker.
+                let pool = &fetcher_pool;
+                let reg = &registry;
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    handle(req, pool, reg);
+                }));
+                if outcome.is_err() {
+                    // install_panic_hook already logged the panic payload.
+                    eprintln!("rust_click: handler panicked; worker kept alive");
+                }
             }
         }));
     }
@@ -145,4 +160,77 @@ fn respond_json(req: tiny_http::Request, body: &str, status: u16) -> std::io::Re
         .with_status_code(status)
         .with_header(header);
     req.respond(resp)
+}
+
+/// Log every panic as one JSON line so it shows up in `kubectl logs`, instead
+/// of only the default multi-line stderr trace.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_default();
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown".to_string());
+        let thread = std::thread::current()
+            .name()
+            .unwrap_or("<unnamed>")
+            .to_string();
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "rust_panic",
+                "thread": thread,
+                "location": location,
+                "message": payload,
+            })
+        );
+        default_hook(info);
+    }));
+}
+
+/// Emit a periodic `rust_pool_stats` line (pooled clients + RSS) so the next
+/// memory problem is visible in `kubectl logs` instead of only in OOMKilled
+/// events. Set `RUST_POOL_STATS_INTERVAL_SECONDS=0` to disable.
+fn spawn_pool_stats_logger(pool: Arc<WreqFetcherPool>) {
+    let seconds = std::env::var("RUST_POOL_STATS_INTERVAL_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(60);
+    if seconds == 0 {
+        return;
+    }
+    thread::spawn(move || loop {
+        thread::sleep(std::time::Duration::from_secs(seconds));
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "rust_pool_stats",
+                "pooled_clients": pool.pooled(),
+                "rss_bytes": process_rss_bytes(),
+            })
+        );
+    });
+}
+
+/// Resident set size in bytes (Linux); 0 when unavailable.
+fn process_rss_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(statm) = std::fs::read_to_string("/proc/self/statm") {
+            if let Some(pages) = statm
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                return pages * 4096;
+            }
+        }
+    }
+    0
 }

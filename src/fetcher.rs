@@ -7,6 +7,8 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -72,8 +74,12 @@ pub struct WreqFetcherPool {
 
 impl WreqFetcherPool {
     pub fn pool_from_env() -> Self {
+        // 1024 retained `wreq`/BoringSSL clients was the memory ceiling that
+        // got the sidecar OOMKilled; 64 keeps the same reuse behaviour with a
+        // bounded footprint (a rotating per-request proxy session means the
+        // pool rarely hits anyway).
         Self::new(
-            env_positive_usize("RUST_CLIENT_POOL_SIZE", 1024),
+            env_positive_usize("RUST_CLIENT_POOL_SIZE", 64),
             env_positive_u64("RUST_MAX_REUSED", 32),
         )
     }
@@ -167,45 +173,250 @@ impl HopFetcher for WreqFetcher {
 
         let client = self.client.clone();
         let url = url.to_string();
-        let ua = ua.to_string();
-        let headers = headers.clone();
+        // Build the exact header list once, so what we log is what we send.
+        let request_headers = build_request_headers(&url, ua, headers);
+        let af_request = is_af_url(&url);
+        let log_enabled = http_log_enabled();
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
 
-        runtime().block_on(async move {
-            let mut rb = client
-                .get(url.as_str())
-                .timeout(Duration::from_millis(timeout));
-            if !ua.is_empty() {
-                rb = rb.header("User-Agent", ua.as_str());
-            }
-            for (k, v) in headers {
-                rb = rb.header(k.as_str(), v.as_str());
-            }
+        if log_enabled {
+            log_http_request(request_id, &url, &request_headers, af_request);
+        }
 
-            let resp = rb.send().await.map_err(|e| e.to_string())?;
+        let started = std::time::Instant::now();
+        let async_url = url.clone();
+        let async_headers = request_headers.clone();
 
-            let status_code = resp.status().as_u16();
-            let server_ip = resp
-                .remote_addr()
-                .map(|a| a.ip().to_string())
-                .unwrap_or_default();
+        // A panic here (e.g. the wreq connection-pool assertion) would unwind
+        // into the caller and poison tiny_http's internal task pool, after which
+        // every worker panics at task_pool.rs and the sidecar stops serving.
+        // Contain it and report a normal error so jump_svc can fall back.
+        let outcome = catch_unwind(AssertUnwindSafe(move || {
+            runtime().block_on(async move {
+                let mut rb = client
+                    .get(async_url.as_str())
+                    .timeout(Duration::from_millis(timeout));
+                for (name, value) in &async_headers {
+                    rb = rb.header(name.as_str(), value.as_str());
+                }
 
-            let mut hmap = HashMap::with_capacity(resp.headers().len());
-            for (k, v) in resp.headers().iter() {
-                hmap.insert(
-                    k.as_str().to_lowercase(),
-                    v.to_str().unwrap_or("").to_string(),
-                );
-            }
+                let resp = rb.send().await.map_err(|e| e.to_string())?;
 
-            // Drain the body so the connection can be reused on the next hop.
-            let _ = resp.bytes().await.map_err(|e| e.to_string())?;
+                let status_code = resp.status().as_u16();
+                let server_ip = resp
+                    .remote_addr()
+                    .map(|a| a.ip().to_string())
+                    .unwrap_or_default();
 
-            Ok(HopResponse {
-                status_code,
-                headers: hmap,
-                server_ip,
+                let mut hmap = HashMap::with_capacity(resp.headers().len());
+                for (k, v) in resp.headers().iter() {
+                    hmap.insert(
+                        k.as_str().to_lowercase(),
+                        v.to_str().unwrap_or("").to_string(),
+                    );
+                }
+
+                // Drain the body so the connection can be reused on the next hop.
+                let body = resp.bytes().await.map_err(|e| e.to_string())?;
+                Ok::<_, String>((status_code, hmap, server_ip, body))
             })
+        }));
+
+        match outcome {
+            Ok(Ok((status_code, hmap, server_ip, body))) => {
+                if log_enabled {
+                    log_http_response(
+                        request_id,
+                        &url,
+                        status_code,
+                        &hmap,
+                        &server_ip,
+                        &body,
+                        started.elapsed().as_millis(),
+                    );
+                }
+                Ok(HopResponse {
+                    status_code,
+                    headers: hmap,
+                    server_ip,
+                })
+            }
+            Ok(Err(err)) => {
+                if log_enabled {
+                    log_http_failure(request_id, &url, &err, started.elapsed().as_millis());
+                }
+                Err(err)
+            }
+            Err(payload) => {
+                let message = panic_message(payload);
+                if log_enabled {
+                    log_http_failure(
+                        request_id,
+                        &url,
+                        &format!("panic: {message}"),
+                        started.elapsed().as_millis(),
+                    );
+                }
+                Err(format!("request panicked: {message}"))
+            }
+        }
+    }
+}
+
+/// Monotonic id correlating request/response log lines.
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+/// AF click hosts: the landing/OneLink domains used by AppsFlyer.
+fn is_af_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "appsflyer.com"
+        || host.ends_with(".appsflyer.com")
+        || host == "onelink.me"
+        || host.ends_with(".onelink.me")
+}
+
+fn is_af_url(raw: &str) -> bool {
+    url::Url::parse(raw)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(is_af_host))
+        .unwrap_or(false)
+}
+
+/// Headers a real browser sends when a user taps an AF click link (top-level
+/// navigation). Only added when the task did not supply them.
+const AF_NAVIGATION_HEADERS: [(&str, &str); 3] = [
+    ("sec-fetch-dest", "document"),
+    ("sec-fetch-site", "cross-site"),
+    ("sec-fetch-mode", "navigate"),
+];
+
+/// Build the exact header list sent on the wire.
+///
+/// Explicit task headers win over the `ua` argument (same precedence as the
+/// previous `rb.header()` order); AF navigation headers are appended last and
+/// only when absent.
+fn build_request_headers(
+    url: &str,
+    ua: &str,
+    headers: &HashMap<String, String>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
+    if !ua.is_empty() {
+        out.push(("User-Agent".to_string(), ua.to_string()));
+    }
+    for (name, value) in headers {
+        out.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+        out.push((name.clone(), value.clone()));
+    }
+    if is_af_url(url) {
+        for (name, value) in AF_NAVIGATION_HEADERS {
+            if !out
+                .iter()
+                .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
+            {
+                out.push((name.to_string(), value.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Full request/response logging is on by default (the operators asked for it);
+/// set `RUST_HTTP_LOG=0` to silence it.
+fn http_log_enabled() -> bool {
+    match std::env::var("RUST_HTTP_LOG") {
+        Ok(value) => {
+            let value = value.trim().to_ascii_lowercase();
+            !(value == "0" || value == "false" || value == "off" || value == "no")
+        }
+        Err(_) => true,
+    }
+}
+
+fn body_preview_max() -> usize {
+    std::env::var("RUST_HTTP_LOG_BODY_MAX")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1024)
+}
+
+fn headers_to_json(headers: &[(String, String)]) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(headers.len());
+    for (name, value) in headers {
+        map.insert(name.clone(), serde_json::Value::String(value.clone()));
+    }
+    serde_json::Value::Object(map)
+}
+
+fn response_headers_to_json(headers: &HashMap<String, String>) -> serde_json::Value {
+    let mut map = serde_json::Map::with_capacity(headers.len());
+    for (name, value) in headers {
+        map.insert(name.clone(), serde_json::Value::String(value.clone()));
+    }
+    serde_json::Value::Object(map)
+}
+
+fn log_http_request(id: u64, url: &str, headers: &[(String, String)], af: bool) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "rust_http_request",
+            "id": id,
+            "method": "GET",
+            "url": url,
+            "af": af,
+            "headers": headers_to_json(headers),
         })
+    );
+}
+
+fn log_http_response(
+    id: u64,
+    url: &str,
+    status: u16,
+    headers: &HashMap<String, String>,
+    server_ip: &str,
+    body: &[u8],
+    elapsed_ms: u128,
+) {
+    let kept = body.len().min(body_preview_max());
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "rust_http_response",
+            "id": id,
+            "url": url,
+            "status": status,
+            "server_ip": server_ip,
+            "headers": response_headers_to_json(headers),
+            "body_bytes": body.len(),
+            "body_truncated": body.len() > kept,
+            "body_preview": String::from_utf8_lossy(&body[..kept]),
+            "elapsed_ms": elapsed_ms,
+        })
+    );
+}
+
+fn log_http_failure(id: u64, url: &str, error: &str, elapsed_ms: u128) {
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "rust_http_failure",
+            "id": id,
+            "url": url,
+            "error": error,
+            "elapsed_ms": elapsed_ms,
+        })
+    );
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic".to_string()
     }
 }
 
@@ -261,5 +472,75 @@ mod tests {
         let _ = pool.fetcher("", &b).unwrap();
 
         assert_eq!(pool.pooled(), 2);
+    }
+
+    fn hdrs(url: &str, ua: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut map = std::collections::HashMap::new();
+        for (k, v) in extra {
+            map.insert((*k).to_string(), (*v).to_string());
+        }
+        super::build_request_headers(url, ua, &map)
+    }
+
+    fn value_of<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn af_urls_get_browser_navigation_headers() {
+        for url in [
+            "https://app.appsflyer.com/1636235979?af_ip=1.2.3.4",
+            "https://dramabox.onelink.me/abc",
+            "https://x.onelink.me/abc",
+        ] {
+            let out = hdrs(url, "UA", &[]);
+            assert_eq!(value_of(&out, "sec-fetch-dest"), Some("document"), "{url}");
+            assert_eq!(value_of(&out, "sec-fetch-site"), Some("cross-site"), "{url}");
+            assert_eq!(value_of(&out, "sec-fetch-mode"), Some("navigate"), "{url}");
+        }
+    }
+
+    #[test]
+    fn non_af_urls_do_not_get_navigation_headers() {
+        for url in [
+            "https://example.com/x",
+            "https://click.sng.link/abc",
+            "https://notappsflyer.com.evil.test/x",
+        ] {
+            let out = hdrs(url, "UA", &[]);
+            assert!(value_of(&out, "sec-fetch-dest").is_none(), "{url}");
+            assert!(value_of(&out, "sec-fetch-mode").is_none(), "{url}");
+        }
+    }
+
+    #[test]
+    fn task_supplied_headers_win_over_navigation_defaults() {
+        let out = hdrs(
+            "https://x.onelink.me/abc",
+            "UA",
+            &[("sec-fetch-mode", "no-cors"), ("sec-fetch-site", "same-origin")],
+        );
+        assert_eq!(value_of(&out, "sec-fetch-mode"), Some("no-cors"));
+        assert_eq!(value_of(&out, "sec-fetch-site"), Some("same-origin"));
+        // 未提供的那个仍然补上，且不重复
+        assert_eq!(value_of(&out, "sec-fetch-dest"), Some("document"));
+        assert_eq!(
+            out.iter().filter(|(k, _)| k == "sec-fetch-mode").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ua_argument_is_overridden_by_explicit_user_agent_header() {
+        let out = hdrs("https://example.com/x", "fallback-ua", &[("user-agent", "task-ua")]);
+        let agents: Vec<&str> = out
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(agents, vec!["task-ua"]);
     }
 }
