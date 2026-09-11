@@ -293,8 +293,8 @@ const AF_NAVIGATION_HEADERS: [(&str, &str); 3] = [
 /// Build the exact header list sent on the wire.
 ///
 /// Explicit task headers win over the `ua` argument (same precedence as the
-/// previous `rb.header()` order); AF navigation headers are appended last and
-/// only when absent.
+/// previous `rb.header()` order). AF navigation headers are applied last and
+/// override task-supplied `sec-fetch-*` values for AF URLs.
 fn build_request_headers(
     url: &str,
     ua: &str,
@@ -309,13 +309,13 @@ fn build_request_headers(
         out.push((name.clone(), value.clone()));
     }
     if is_af_url(url) {
+        // AF click URLs must always look like a cross-site top-level
+        // navigation. The queued task ships its own sec-fetch-* values
+        // (upstream sends `sec-fetch-site: none`), so these deliberately
+        // override the task headers instead of only filling gaps.
         for (name, value) in AF_NAVIGATION_HEADERS {
-            if !out
-                .iter()
-                .any(|(existing, _)| existing.eq_ignore_ascii_case(name))
-            {
-                out.push((name.to_string(), value.to_string()));
-            }
+            out.retain(|(existing, _)| !existing.eq_ignore_ascii_case(name));
+            out.push((name.to_string(), value.to_string()));
         }
     }
     out
@@ -517,20 +517,35 @@ mod tests {
     }
 
     #[test]
-    fn task_supplied_headers_win_over_navigation_defaults() {
+    fn af_navigation_headers_override_task_values() {
+        // 线上队列会带 sec-fetch-site: none，AF 请求必须强制成 cross-site。
         let out = hdrs(
             "https://x.onelink.me/abc",
             "UA",
-            &[("sec-fetch-mode", "no-cors"), ("sec-fetch-site", "same-origin")],
+            &[
+                ("sec-fetch-site", "none"),
+                ("sec-fetch-mode", "no-cors"),
+                ("sec-fetch-dest", "empty"),
+            ],
         );
-        assert_eq!(value_of(&out, "sec-fetch-mode"), Some("no-cors"));
-        assert_eq!(value_of(&out, "sec-fetch-site"), Some("same-origin"));
-        // 未提供的那个仍然补上，且不重复
+        assert_eq!(value_of(&out, "sec-fetch-site"), Some("cross-site"));
+        assert_eq!(value_of(&out, "sec-fetch-mode"), Some("navigate"));
         assert_eq!(value_of(&out, "sec-fetch-dest"), Some("document"));
-        assert_eq!(
-            out.iter().filter(|(k, _)| k == "sec-fetch-mode").count(),
-            1
+        for name in ["sec-fetch-site", "sec-fetch-mode", "sec-fetch-dest"] {
+            assert_eq!(out.iter().filter(|(k, _)| k == name).count(), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn non_af_urls_keep_task_supplied_sec_fetch_values() {
+        let out = hdrs(
+            "https://example.com/x",
+            "UA",
+            &[("sec-fetch-site", "none"), ("sec-fetch-mode", "no-cors")],
         );
+        assert_eq!(value_of(&out, "sec-fetch-site"), Some("none"));
+        assert_eq!(value_of(&out, "sec-fetch-mode"), Some("no-cors"));
+        assert!(value_of(&out, "sec-fetch-dest").is_none());
     }
 
     #[test]
